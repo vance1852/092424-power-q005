@@ -5,13 +5,31 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import (
+    AMBIGUITY_POLICY_FIRST_OCCURRENCE,
+    GAP_POLICY_SHIFT_FORWARD,
+    SystemClock,
+    calendar_version,
+    facility_zone,
+    local_window,
+    parse_utc,
+    utc_text,
+)
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    ArrivalReceipt,
+    ArrivalShipment,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -32,7 +50,14 @@ from .storage import initialize, transaction
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "shipment.write",
+        "shipment.scan",
+    },
     "risk": {"outage.write", "scenario.approve", "report.read"},
     "auditor": {"report.read", "audit.read"},
 }
@@ -296,6 +321,254 @@ class SupplyService:
             (facility_id, product),
         ).fetchall()
         return {"facility_id": facility_id, "product": product, **weighted_inventory_cost(rows)}
+
+    def _facility_row(self, facility_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM facilities WHERE facility_id=?", (facility_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("设施不存在")
+        return row
+
+    def register_shipment(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """登记预报到厂的燃料船，并在发运时冻结设施本地的到厂窗口。"""
+        self._require(actor_id, "shipment.write")
+        shipment = ArrivalShipment.from_dict(raw)
+        facility = self._facility_row(shipment.facility_id)
+        try:
+            zone = facility_zone(facility["timezone"])
+            window = local_window(
+                zone,
+                date.fromisoformat(shipment.window_date),
+                shipment.window_start_local,
+                shipment.window_end_local,
+            )
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        version = calendar_version()
+        try:
+            with transaction(self.connection, immediate=True):
+                cursor = self.connection.execute(
+                    "INSERT INTO arrival_shipments(shipment_id,facility_id,product,grade,expected_mwh,"
+                    "unit_cost_cny,window_date,timezone,window_start_local,window_end_local,gap_policy,"
+                    "ambiguity_policy,calendar_version,window_starts_at,window_ends_at,crosses_midnight,"
+                    "start_resolution,end_resolution,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        shipment.shipment_id,
+                        shipment.facility_id,
+                        shipment.product,
+                        shipment.grade,
+                        decimal_text(shipment.expected_mwh),
+                        decimal_text(shipment.unit_cost_cny),
+                        shipment.window_date,
+                        facility["timezone"],
+                        shipment.window_start_local,
+                        shipment.window_end_local,
+                        GAP_POLICY_SHIFT_FORWARD,
+                        AMBIGUITY_POLICY_FIRST_OCCURRENCE,
+                        version,
+                        utc_text(window["starts_at"]),
+                        utc_text(window["ends_at"]),
+                        1 if window["crosses_midnight"] else 0,
+                        window["start_resolution"],
+                        window["end_resolution"],
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self._audit(
+                    "arrival_shipment",
+                    shipment.shipment_id,
+                    "shipment.registered",
+                    actor_id,
+                    {
+                        "window_starts_at": utc_text(window["starts_at"]),
+                        "window_ends_at": utc_text(window["ends_at"]),
+                        "calendar_version": version,
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("燃料船编号冲突或设施不存在") from exc
+        return self.shipment(shipment.shipment_id)
+
+    def _shipment_row(self, shipment_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM arrival_shipments WHERE shipment_id=?", (shipment_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("燃料船预报不存在")
+        return row
+
+    def _shipment_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["crosses_midnight"] = bool(row["crosses_midnight"])
+        result["overrun_accepted"] = bool(row["overrun_accepted"])
+        receipts = self.connection.execute(
+            "SELECT receipt_id,arrived_at,quantity_mwh,cumulative_mwh,lot_id,created_at "
+            "FROM arrival_receipts WHERE shipment_id=? ORDER BY arrived_at,receipt_id",
+            (row["shipment_id"],),
+        ).fetchall()
+        result["receipts"] = [dict(item) for item in receipts]
+        result["on_time"] = (
+            row["state"] != "overdue"
+            and all(item["arrived_at"] <= row["window_ends_at"] for item in receipts)
+        )
+        return result
+
+    def shipment(self, shipment_id: str) -> dict[str, Any]:
+        return self._shipment_dict(self._shipment_row(shipment_id))
+
+    def list_shipments(self, facility_id: str | None = None) -> dict[str, Any]:
+        if facility_id is None:
+            rows = self.connection.execute(
+                "SELECT shipment_id FROM arrival_shipments ORDER BY shipment_id"
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT shipment_id FROM arrival_shipments WHERE facility_id=? ORDER BY shipment_id",
+                (facility_id,),
+            ).fetchall()
+        return {"shipments": [self.shipment(row["shipment_id"]) for row in rows]}
+
+    def record_shipment_receipt(
+        self, actor_id: str, shipment_id: str, raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """签收一批到厂燃料：库存只增加本次新增数量，累计量记录在批次上。"""
+        self._require(actor_id, "shipment.write")
+        receipt = ArrivalReceipt.from_dict(raw)
+        arrived_at = utc_text(parse_utc(receipt.arrived_at, "arrived_at"))
+        shipment = self._shipment_row(shipment_id)
+        if arrived_at < shipment["window_starts_at"]:
+            raise Conflict("到厂时刻早于到厂窗口开始时间")
+        quantity = quantize_volume(receipt.quantity_mwh)
+        received_before = Decimal(shipment["received_mwh"])
+        cumulative = quantize_volume(received_before + quantity)
+        expected = Decimal(shipment["expected_mwh"])
+        overrun = cumulative > expected
+        accept_overrun = bool(raw.get("accept_overrun", False)) if isinstance(raw, Mapping) else False
+        if overrun and not accept_overrun:
+            raise Conflict("累计签收量超过预报数量，需显式 accept_overrun")
+        late = arrived_at > shipment["window_ends_at"]
+        complete = cumulative >= expected
+        if shipment["state"] == "overdue" and not complete:
+            new_state = "overdue"
+        else:
+            new_state = "received" if complete else "partial"
+        lot_id = f"{shipment_id}-{receipt.receipt_id}"
+        try:
+            with transaction(self.connection, immediate=True):
+                self.connection.execute(
+                    "INSERT INTO inventory_lots(lot_id,facility_id,product,grade,quantity_mwh,"
+                    "available_mwh,unit_cost_cny,received_at,created_by,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        lot_id,
+                        shipment["facility_id"],
+                        shipment["product"],
+                        shipment["grade"],
+                        decimal_text(quantity),
+                        decimal_text(quantity),
+                        decimal_text(Decimal(shipment["unit_cost_cny"])),
+                        arrived_at,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self.connection.execute(
+                    "INSERT INTO arrival_receipts(receipt_id,shipment_id,arrived_at,quantity_mwh,"
+                    "cumulative_mwh,lot_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        receipt.receipt_id,
+                        shipment_id,
+                        arrived_at,
+                        decimal_text(quantity),
+                        decimal_text(cumulative),
+                        lot_id,
+                        actor_id,
+                        self._now(),
+                    ),
+                )
+                self.connection.execute(
+                    "UPDATE arrival_shipments SET received_mwh=?,lot_id=COALESCE(lot_id,?),"
+                    "state=?,overrun_accepted=?,revision=revision+1 WHERE shipment_id=? AND revision=?",
+                    (
+                        decimal_text(cumulative),
+                        lot_id,
+                        new_state,
+                        1 if overrun else shipment["overrun_accepted"],
+                        shipment_id,
+                        shipment["revision"],
+                    ),
+                )
+                self._audit(
+                    "arrival_shipment",
+                    shipment_id,
+                    "shipment.received",
+                    actor_id,
+                    {
+                        "receipt_id": receipt.receipt_id,
+                        "delta_mwh": decimal_text(quantity),
+                        "cumulative_mwh": decimal_text(cumulative),
+                        "late": late,
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("签收编号或库存批次冲突（不能重复签收）") from exc
+        response = self.shipment(shipment_id)
+        response["last_receipt"] = {
+            "receipt_id": receipt.receipt_id,
+            "delta_mwh": decimal_text(quantity),
+            "cumulative_mwh": decimal_text(cumulative),
+            "inventory_lot_id": lot_id,
+            "late": late,
+        }
+        return response
+
+    def scan_shipments(self, actor_id: str) -> dict[str, Any]:
+        """按发运时冻结的窗口扫描超时批次；重复扫描不会改变状态或库存。"""
+        self._require(actor_id, "shipment.scan")
+        now_text = self._now()
+        rows = self.connection.execute(
+            "SELECT * FROM arrival_shipments WHERE state IN ('expected','partial') "
+            "AND window_ends_at<? ORDER BY window_ends_at,shipment_id",
+            (now_text,),
+        ).fetchall()
+        marked: list[str] = []
+        with transaction(self.connection, immediate=True):
+            for row in rows:
+                cursor = self.connection.execute(
+                    "UPDATE arrival_shipments SET state='overdue',overdue_marked_at=?,"
+                    "revision=revision+1 WHERE shipment_id=? AND state IN ('expected','partial')",
+                    (now_text, row["shipment_id"]),
+                )
+                if cursor.rowcount == 1:
+                    marked.append(row["shipment_id"])
+                    self._audit(
+                        "arrival_shipment",
+                        row["shipment_id"],
+                        "shipment.overdue",
+                        actor_id,
+                        {"scanned_at": now_text, "window_ends_at": row["window_ends_at"]},
+                    )
+        due = self.connection.execute(
+            "SELECT shipment_id FROM arrival_shipments WHERE window_ends_at<=? "
+            "ORDER BY window_ends_at,shipment_id",
+            (now_text,),
+        ).fetchall()
+        return {
+            "scanned_at": now_text,
+            "newly_overdue": marked,
+            "overdue": [
+                self.shipment(row["shipment_id"])
+                for row in self.connection.execute(
+                    "SELECT shipment_id FROM arrival_shipments WHERE state='overdue' "
+                    "ORDER BY window_ends_at,shipment_id"
+                ).fetchall()
+            ],
+            "due_count": len(due),
+            "repeat_scan": not marked,
+        }
 
     def submit_nomination(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
         self._require(actor_id, "nomination.write")

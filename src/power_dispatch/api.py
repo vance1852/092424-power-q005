@@ -71,6 +71,19 @@ class JsonApplication:
                 return Response(201, self.service.add_inventory_lot(actor, payload))
             if method == "GET" and path == "/inventory/summary":
                 return Response(200, self.service.inventory_summary(query.get("facility_id", [""])[0], query.get("product", [""])[0]))
+            if method == "POST" and path == "/shipments":
+                return Response(201, self.service.register_shipment(actor, payload))
+            if method == "GET" and path == "/shipments":
+                facility = query.get("facility_id", [None])[0]
+                return Response(200, self.service.list_shipments(facility))
+            if method == "POST" and path == "/shipments/scan":
+                return Response(200, self.service.scan_shipments(actor))
+            if method == "POST" and len(parts) == 3 and parts[0] == "shipments" and parts[2] == "scan":
+                return Response(200, self.service.scan_shipments(actor))
+            if method == "POST" and len(parts) == 3 and parts[0] == "shipments" and parts[2] == "receipts":
+                return Response(201, self.service.record_shipment_receipt(actor, parts[1], payload))
+            if method == "GET" and len(parts) == 2 and parts[0] == "shipments":
+                return Response(200, self.service.shipment(parts[1]))
             if method == "POST" and path == "/nominations":
                 return Response(201, self.service.submit_nomination(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":

@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import facility_zone, parse_utc, parse_wall_clock
 from .errors import ValidationFailed
 
 
@@ -110,14 +110,16 @@ class Facility:
         kind = required_text(raw.get("kind"), "kind", 24)
         if kind not in ROUTE_KINDS:
             raise ValidationFailed("kind 不是受支持的设施类型")
-        timezone = required_text(raw.get("timezone"), "timezone", 64)
-        if "/" not in timezone and timezone != "UTC":
-            raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        timezone_name = required_text(raw.get("timezone"), "timezone", 64)
+        try:
+            facility_zone(timezone_name)
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
         return cls(
             facility_id=identifier(raw.get("facility_id"), "facility_id"),
             name=required_text(raw.get("name"), "name"),
             kind=kind,
-            timezone=timezone,
+            timezone=timezone_name,
             capacity_mwh=decimal_value(
                 raw.get("capacity_mwh"), "capacity_mwh", minimum=Decimal("0")
             ),
@@ -191,6 +193,66 @@ class InventoryLot:
                 raw.get("unit_cost_cny"), "unit_cost_cny", minimum=Decimal("0")
             ),
             received_at=received_at,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ArrivalShipment:
+    shipment_id: str
+    facility_id: str
+    product: str
+    grade: str
+    expected_mwh: Decimal
+    unit_cost_cny: Decimal
+    window_date: str
+    window_start_local: str
+    window_end_local: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ArrivalShipment":
+        product = required_text(raw.get("product"), "product", 32)
+        if product not in PRODUCTS:
+            raise ValidationFailed("product 不是受支持的电源类型")
+        return cls(
+            shipment_id=identifier(raw.get("shipment_id"), "shipment_id"),
+            facility_id=identifier(raw.get("facility_id"), "facility_id"),
+            product=product,
+            grade=required_text(raw.get("grade"), "grade", 32).upper(),
+            expected_mwh=decimal_value(
+                raw.get("expected_mwh"), "expected_mwh", minimum=Decimal("0.001")
+            ),
+            unit_cost_cny=decimal_value(
+                raw.get("unit_cost_cny"), "unit_cost_cny", minimum=Decimal("0")
+            ),
+            window_date=date_text(raw.get("window_date"), "window_date"),
+            window_start_local=parse_wall_clock(
+                raw.get("window_start_local"), "window_start_local"
+            ),
+            window_end_local=parse_wall_clock(
+                raw.get("window_end_local"), "window_end_local", allow_end_of_day=True
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ArrivalReceipt:
+    receipt_id: str
+    arrived_at: str
+    quantity_mwh: Decimal
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "ArrivalReceipt":
+        arrived_at = required_text(raw.get("arrived_at"), "arrived_at", 40)
+        try:
+            parse_utc(arrived_at, "arrived_at")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return cls(
+            receipt_id=identifier(raw.get("receipt_id"), "receipt_id"),
+            arrived_at=arrived_at,
+            quantity_mwh=decimal_value(
+                raw.get("quantity_mwh"), "quantity_mwh", minimum=Decimal("0.001")
+            ),
         )
 
 

@@ -92,6 +92,55 @@ CREATE TABLE IF NOT EXISTS inventory_lots (
 CREATE INDEX IF NOT EXISTS idx_inventory_available
 ON inventory_lots(facility_id, product, received_at);
 
+CREATE TABLE IF NOT EXISTS arrival_shipments (
+    shipment_id TEXT PRIMARY KEY,
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    product TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    expected_mwh TEXT NOT NULL,
+    unit_cost_cny TEXT NOT NULL,
+    received_mwh TEXT NOT NULL DEFAULT '0',
+    lot_id TEXT REFERENCES inventory_lots(lot_id),
+    -- 发运时冻结的到厂窗口与日历规则，重启后不再重新解析。
+    window_date TEXT NOT NULL,
+    timezone TEXT NOT NULL,
+    window_start_local TEXT NOT NULL,
+    window_end_local TEXT NOT NULL,
+    gap_policy TEXT NOT NULL,
+    ambiguity_policy TEXT NOT NULL,
+    calendar_version TEXT NOT NULL,
+    window_starts_at TEXT NOT NULL,
+    window_ends_at TEXT NOT NULL,
+    crosses_midnight INTEGER NOT NULL CHECK(crosses_midnight IN (0,1)),
+    start_resolution TEXT NOT NULL,
+    end_resolution TEXT NOT NULL,
+    overrun_accepted INTEGER NOT NULL DEFAULT 0 CHECK(overrun_accepted IN (0,1)),
+    state TEXT NOT NULL DEFAULT 'expected'
+        CHECK(state IN ('expected','partial','received','overdue')),
+    overdue_marked_at TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_arrival_shipments_scan
+ON arrival_shipments(state, window_ends_at);
+
+CREATE TABLE IF NOT EXISTS arrival_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    shipment_id TEXT NOT NULL REFERENCES arrival_shipments(shipment_id),
+    arrived_at TEXT NOT NULL,
+    quantity_mwh TEXT NOT NULL,
+    cumulative_mwh TEXT NOT NULL,
+    lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(shipment_id, receipt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_arrival_receipts_shipment
+ON arrival_receipts(shipment_id, arrived_at);
+
 CREATE TABLE IF NOT EXISTS inventory_adjustments (
     adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
     lot_id TEXT NOT NULL REFERENCES inventory_lots(lot_id),
@@ -198,7 +247,10 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    # ThreadingHTTPServer 在工作线程中处理请求；写入由 BEGIN IMMEDIATE 与 busy_timeout 串行化。
+    connection = sqlite3.connect(
+        str(path), isolation_level=None, timeout=10, check_same_thread=False
+    )
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")
