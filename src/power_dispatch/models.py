@@ -8,7 +8,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping
 
-from .clock import parse_utc
+from .clock import load_zone, parse_naive_local, parse_utc
 from .errors import ValidationFailed
 
 
@@ -110,14 +110,16 @@ class Facility:
         kind = required_text(raw.get("kind"), "kind", 24)
         if kind not in ROUTE_KINDS:
             raise ValidationFailed("kind 不是受支持的设施类型")
-        timezone = required_text(raw.get("timezone"), "timezone", 64)
-        if "/" not in timezone and timezone != "UTC":
-            raise ValidationFailed("timezone 必须是 IANA 时区或 UTC")
+        timezone_name = required_text(raw.get("timezone"), "timezone", 64)
+        try:
+            load_zone(timezone_name, "timezone")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
         return cls(
             facility_id=identifier(raw.get("facility_id"), "facility_id"),
             name=required_text(raw.get("name"), "name"),
             kind=kind,
-            timezone=timezone,
+            timezone=timezone_name,
             capacity_mwh=decimal_value(
                 raw.get("capacity_mwh"), "capacity_mwh", minimum=Decimal("0")
             ),
@@ -260,3 +262,28 @@ class SupplyScenario:
             route_capacity_changes=parsed_routes,
             demand_changes=parsed_demand,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryWindowSpec:
+    """发运时登记的到厂窗口规格；ETA 是设施本地日历时刻，不含时区偏移。"""
+
+    eta_local: str
+    grace_hours: int
+    batch_no: int
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DeliveryWindowSpec":
+        eta_local = required_text(raw.get("eta_local"), "eta_local", 40)
+        try:
+            parse_naive_local(eta_local, "eta_local")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        grace = raw.get("grace_hours", 2)
+        if isinstance(grace, bool) or not isinstance(grace, int) or not 0 <= grace <= 168:
+            raise ValidationFailed("grace_hours 必须是 0 到 168 的整数")
+        batch_no = raw.get("batch_no", 1)
+        if isinstance(batch_no, bool) or not isinstance(batch_no, int) or not 1 <= batch_no <= 9999:
+            raise ValidationFailed("batch_no 必须是 1 到 9999 的正整数")
+        return cls(eta_local=eta_local, grace_hours=grace, batch_no=batch_no)
+

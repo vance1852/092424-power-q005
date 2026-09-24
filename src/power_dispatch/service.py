@@ -5,13 +5,31 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from .clock import SystemClock, parse_utc, utc_text
+from .clock import (
+    SystemClock,
+    load_zone,
+    parse_naive_local,
+    parse_utc,
+    resolve_local,
+    utc_text,
+    tz_version,
+)
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
-from .models import IndexQuote, Facility, InventoryLot, NominationRequest, Route, SupplyScenario
+from .models import (
+    DeliveryWindowSpec,
+    IndexQuote,
+    Facility,
+    InventoryLot,
+    NominationRequest,
+    Route,
+    SupplyScenario,
+    decimal_value,
+    identifier,
+)
 from .planning import (
     AllocationRequest,
     PricePoint,
@@ -32,9 +50,16 @@ from .storage import initialize, transaction
 
 ROLE_PERMISSIONS = {
     "planner": {"quote.write", "catalog.write", "scenario.write", "scenario.run"},
-    "dispatcher": {"nomination.write", "allocation.run", "transfer.write", "inventory.write"},
+    "dispatcher": {
+        "nomination.write",
+        "allocation.run",
+        "transfer.write",
+        "inventory.write",
+        "delivery.write",
+        "delivery.read",
+    },
     "risk": {"outage.write", "scenario.approve", "report.read"},
-    "auditor": {"report.read", "audit.read"},
+    "auditor": {"report.read", "audit.read", "delivery.read"},
 }
 
 
@@ -463,6 +488,444 @@ class SupplyService:
             "loaded_mwh": decimal_text(allocated),
             "expected_delivered_mwh": decimal_text(expected_delivery),
             "expected_arrival": utc_text(parse_utc(departed_at) + timedelta(hours=int(nomination["transit_hours"]))),
+        }
+
+    def _transfer_destination(self, transfer_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT t.*,r.destination_id,r.product FROM transfers t "
+            "JOIN nominations n ON n.nomination_id=t.nomination_id "
+            "JOIN routes r ON r.route_id=n.route_id WHERE t.transfer_id=?",
+            (transfer_id,),
+        ).fetchone()
+        if row is None:
+            raise NotFound("送电单不存在")
+        return row
+
+    def _resolve_window_spec(self, facility: sqlite3.Row, spec: DeliveryWindowSpec) -> dict[str, Any]:
+        """按目的地设施的 IANA 日历解析 ETA，并冻结 tzdata 版本与截止时刻。"""
+        zone = load_zone(facility["timezone"], "facility.timezone")
+        eta_instant, eta_kind = resolve_local(parse_naive_local(spec.eta_local, "eta_local"), zone)
+        deadline = eta_instant + timedelta(hours=spec.grace_hours)
+        return {
+            "facility_id": facility["facility_id"],
+            "timezone": facility["timezone"],
+            "tz_version": tz_version(),
+            "eta_local": spec.eta_local,
+            "eta_kind": eta_kind,
+            "eta_at": utc_text(eta_instant),
+            "deadline_at": utc_text(deadline),
+            "grace_hours": spec.grace_hours,
+        }
+
+    def open_delivery_window(self, actor_id: str, transfer_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "delivery.write")
+        spec = DeliveryWindowSpec.from_dict(raw)
+        transfer = self._transfer_destination(transfer_id)
+        facility = self.connection.execute(
+            "SELECT * FROM facilities WHERE facility_id=?", (transfer["destination_id"],)
+        ).fetchone()
+        if facility is None:  # pragma: no cover - 外键已保证
+            raise NotFound("目的地设施不存在")
+        if self.connection.execute(
+            "SELECT 1 FROM delivery_windows WHERE transfer_id=? AND batch_no=?",
+            (transfer_id, spec.batch_no),
+        ).fetchone() is not None:
+            raise Conflict("该批次的到厂窗口已经存在")
+        resolved = self._resolve_window_spec(facility, spec)
+        expected = quantize_volume(Decimal(transfer["expected_delivered_mwh"]))
+        with transaction(self.connection, immediate=True):
+            window_id = self._insert_window_row(
+                transfer_id, spec.batch_no, resolved, expected, Decimal("0"), "open", actor_id
+            )
+            self._audit("delivery_window", str(window_id), "delivery.window_opened", actor_id, {
+                "transfer_id": transfer_id,
+                "batch_no": spec.batch_no,
+                "timezone": resolved["timezone"],
+                "tz_version": resolved["tz_version"],
+                "eta_local": resolved["eta_local"],
+                "eta_kind": resolved["eta_kind"],
+                "deadline_at": resolved["deadline_at"],
+            })
+        return self._window_dict(window_id)
+
+    def _insert_window_row(
+        self,
+        transfer_id: str,
+        batch_no: int,
+        resolved: Mapping[str, Any],
+        expected_mwh: Decimal,
+        received_mwh: Decimal,
+        state: str,
+        actor_id: str,
+        carried_from_window_id: int | None = None,
+    ) -> int:
+        cursor = self.connection.execute(
+            "INSERT INTO delivery_windows(transfer_id,batch_no,facility_id,timezone,tz_version,"
+            "eta_local,eta_kind,eta_at,deadline_at,grace_hours,expected_mwh,received_mwh,state,"
+            "carried_from_window_id,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                transfer_id,
+                batch_no,
+                resolved["facility_id"],
+                resolved["timezone"],
+                resolved["tz_version"],
+                resolved["eta_local"],
+                resolved["eta_kind"],
+                resolved["eta_at"],
+                resolved["deadline_at"],
+                resolved["grace_hours"],
+                decimal_text(quantize_volume(expected_mwh)),
+                decimal_text(quantize_volume(received_mwh)),
+                state,
+                carried_from_window_id,
+                actor_id,
+                self._now(),
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def _window_dict(self, window_id: int) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM delivery_windows WHERE window_id=?", (window_id,)).fetchone()
+        if row is None:  # pragma: no cover - 仅内部调用
+            raise NotFound("到厂窗口不存在")
+        result = dict(row)
+        result["remaining_mwh"] = decimal_text(
+            quantize_volume(Decimal(row["expected_mwh"]) - Decimal(row["received_mwh"]))
+        )
+        return result
+
+    def _active_window(self, transfer_id: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM delivery_windows WHERE transfer_id=? AND state IN ('open','partial') "
+            "ORDER BY batch_no LIMIT 1",
+            (transfer_id,),
+        ).fetchone()
+
+    def _post_destination_inventory(
+        self,
+        *,
+        transfer: sqlite3.Row,
+        origin: sqlite3.Row,
+        batch_no: int,
+        quantity: Decimal,
+        received_at: str,
+        actor_id: str,
+    ) -> str:
+        """把签收数量登记到目的地设施库存；重复扫描不会重复增加库存。
+
+        必须在已经打开的事务内调用。
+        """
+        lot_id = f"{transfer['transfer_id']}:b{batch_no}"
+        amount = quantize_volume(quantity)
+        existing = self.connection.execute(
+            "SELECT quantity_mwh,available_mwh FROM inventory_lots WHERE lot_id=?", (lot_id,)
+        ).fetchone()
+        if existing is None:
+            self.connection.execute(
+                "INSERT INTO inventory_lots(lot_id,facility_id,product,grade,quantity_mwh,"
+                "available_mwh,unit_cost_cny,received_at,created_by,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    lot_id,
+                    transfer["destination_id"],
+                    transfer["product"],
+                    origin["grade"],
+                    decimal_text(amount),
+                    decimal_text(amount),
+                    origin["unit_cost_cny"],
+                    received_at,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+        else:
+            total_quantity = quantize_volume(Decimal(existing["quantity_mwh"]) + amount)
+            total_available = quantize_volume(Decimal(existing["available_mwh"]) + amount)
+            self.connection.execute(
+                "UPDATE inventory_lots SET quantity_mwh=?,available_mwh=?,revision=revision+1 "
+                "WHERE lot_id=?",
+                (decimal_text(total_quantity), decimal_text(total_available), lot_id),
+            )
+        return lot_id
+
+    def record_delivery_scan(self, actor_id: str, transfer_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        self._require(actor_id, "delivery.write")
+        try:
+            scanned_at = parse_utc(str(raw.get("scanned_at") or ""), "scanned_at")
+            quantity = decimal_value(raw.get("quantity_mwh"), "quantity_mwh", minimum=Decimal("0.001"))
+            idempotency_key = identifier(raw.get("idempotency_key"), "idempotency_key")
+        except ValueError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        note = str(raw.get("note") or "")
+
+        stored = self.connection.execute(
+            "SELECT response_json FROM supply_idempotency WHERE scope='delivery_scan' AND idempotency_key=?",
+            (idempotency_key,),
+        ).fetchone()
+        if stored is not None:
+            return json.loads(stored["response_json"])
+
+        scanned_text = utc_text(scanned_at)
+        quantity_text = decimal_text(quantize_volume(quantity))
+        transfer = self._transfer_destination(transfer_id)
+        natural_duplicate = self.connection.execute(
+            "SELECT scan_id FROM delivery_scans WHERE transfer_id=? AND scanned_at=? AND quantity_mwh=? "
+            "AND classification IN ('on_time','late') ORDER BY scan_id LIMIT 1",
+            (transfer_id, scanned_text, quantity_text),
+        ).fetchone()
+        if natural_duplicate is not None:
+            return self._record_duplicate_scan(
+                actor_id, transfer_id, scanned_at, quantity, idempotency_key,
+                int(natural_duplicate["scan_id"]), note,
+            )
+
+        active = self._active_window(transfer_id)
+        if active is None:
+            raise InvalidState("到厂窗口已全部关闭，不能再登记签收")
+
+        remaining = quantize_volume(Decimal(active["expected_mwh"]) - Decimal(active["received_mwh"]))
+        if quantity > remaining:
+            raise Conflict(f"签收数量超过批次待收 {decimal_text(remaining)}")
+
+        is_late = scanned_at > parse_utc(active["deadline_at"])
+        # 只允许从原始批次滚动一次；结转批继承同一冻结窗口，继续吸收后续迟到货物。
+        rollover = is_late and active["carried_from_window_id"] is None
+        origin = self.connection.execute(
+            "SELECT product,grade,unit_cost_cny FROM inventory_lots WHERE lot_id=?",
+            (transfer["inventory_lot_id"],),
+        ).fetchone()
+        if origin is None:  # pragma: no cover - 外键已保证
+            raise NotFound("源燃料批次不存在")
+
+        with transaction(self.connection, immediate=True):
+            judged_window_id = int(active["window_id"])
+            judged_batch_no = int(active["batch_no"])
+            if rollover:
+                # 原批次只冻结此前已准时签收的数量并以“结转关闭”归档；新增数量结转到
+                # 新批次，新批次继承发运时冻结的同一窗口版本（相同 ETA、截止时刻、时区
+                # 与 tzdata 版本）。本次实到货物计入新批次，已签收部分不会被误判为超时。
+                self.connection.execute(
+                    "UPDATE delivery_windows SET state='closed_carried',closes_at=? "
+                    "WHERE window_id=? AND state IN ('open','partial')",
+                    (scanned_text, judged_window_id),
+                )
+                carried_resolved = {
+                    "facility_id": active["facility_id"],
+                    "timezone": active["timezone"],
+                    "tz_version": active["tz_version"],
+                    "eta_local": active["eta_local"],
+                    "eta_kind": active["eta_kind"],
+                    "eta_at": active["eta_at"],
+                    "deadline_at": active["deadline_at"],
+                    "grace_hours": int(active["grace_hours"]),
+                }
+                judged_window_id = self._insert_window_row(
+                    transfer_id,
+                    judged_batch_no + 1,
+                    carried_resolved,
+                    remaining,
+                    Decimal("0"),
+                    "open",
+                    actor_id,
+                    carried_from_window_id=int(active["window_id"]),
+                )
+                judged_batch_no += 1
+                self._audit("delivery_window", str(judged_window_id), "delivery.window_carried", actor_id, {
+                    "transfer_id": transfer_id,
+                    "batch_no": judged_batch_no,
+                    "carried_from_window_id": int(active["window_id"]),
+                    "carried_mwh": decimal_text(remaining),
+                    "tz_version": active["tz_version"],
+                })
+
+            lot_id = self._post_destination_inventory(
+                transfer=transfer,
+                origin=origin,
+                batch_no=judged_batch_no,
+                quantity=quantity,
+                received_at=scanned_text,
+                actor_id=actor_id,
+            )
+            judged_row = self.connection.execute(
+                "SELECT * FROM delivery_windows WHERE window_id=?", (judged_window_id,)
+            ).fetchone()
+            new_received = quantize_volume(Decimal(judged_row["received_mwh"]) + quantity)
+            closes = new_received >= Decimal(judged_row["expected_mwh"])
+            if closes:
+                new_state = "closed_late" if is_late else "closed_on_time"
+            else:
+                new_state = "partial"
+            cursor = self.connection.execute(
+                "INSERT INTO delivery_scans(window_id,transfer_id,scanned_at,quantity_mwh,applied_mwh,"
+                "classification,note,idempotency_key,actor_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    judged_window_id,
+                    transfer_id,
+                    scanned_text,
+                    quantity_text,
+                    quantity_text,
+                    "late" if is_late else "on_time",
+                    note,
+                    idempotency_key,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            scan_id = int(cursor.lastrowid)
+            self.connection.execute(
+                "UPDATE delivery_windows SET received_mwh=?,state=?,closes_at=? WHERE window_id=?",
+                (decimal_text(new_received), new_state, scanned_text if closes else None, judged_window_id),
+            )
+            finalized = False
+            if closes:
+                finalized = self._finalize_delivery(transfer_id, scanned_at)
+            response = {
+                "scan_id": scan_id,
+                "transfer_id": transfer_id,
+                "batch_no": judged_batch_no,
+                "scanned_at": scanned_text,
+                "quantity_mwh": quantity_text,
+                "applied_mwh": quantity_text,
+                "classification": "late" if is_late else "on_time",
+                "window_state": new_state,
+                "destination_lot_id": lot_id,
+            }
+            if finalized:
+                response["delivery_state"] = "delivered"
+            self.connection.execute(
+                "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                "VALUES('delivery_scan',?,?,?,?)",
+                (idempotency_key, digest(raw), canonical_json(response), self._now()),
+            )
+            self._audit(
+                "delivery_scan",
+                str(scan_id),
+                "delivery.scan_recorded",
+                actor_id,
+                {"transfer_id": transfer_id, "classification": response["classification"], "applied_mwh": quantity_text},
+            )
+        return response
+
+    def _finalize_delivery(self, transfer_id: str, arrived_at: str) -> bool:
+        """在当前事务内把送电单与提名标记为已签收，返回是否全部批次结清。"""
+        open_count = self.connection.execute(
+            "SELECT COUNT(*) AS c FROM delivery_windows WHERE transfer_id=? AND state IN ('open','partial')",
+            (transfer_id,),
+        ).fetchone()["c"]
+        if open_count:
+            return False
+        total_rows = self.connection.execute(
+            "SELECT received_mwh FROM delivery_windows WHERE transfer_id=?", (transfer_id,)
+        ).fetchall()
+        total = quantize_volume(sum((Decimal(row["received_mwh"]) for row in total_rows), Decimal("0")))
+        nomination_id = self.connection.execute(
+            "SELECT nomination_id FROM transfers WHERE transfer_id=?", (transfer_id,)
+        ).fetchone()["nomination_id"]
+        self.connection.execute(
+            "UPDATE nominations SET delivered_mwh=?,state='delivered',revision=revision+1 WHERE nomination_id=?",
+            (decimal_text(total), nomination_id),
+        )
+        self.connection.execute(
+            "UPDATE transfers SET arrived_at=?,state='delivered',revision=revision+1 WHERE transfer_id=?",
+            (arrived_at, transfer_id),
+        )
+        return True
+
+    def _record_duplicate_scan(
+        self,
+        actor_id: str,
+        transfer_id: str,
+        scanned_at: datetime,
+        quantity: Decimal,
+        idempotency_key: str,
+        original_scan_id: int,
+        note: str,
+    ) -> dict[str, Any]:
+        original = self.connection.execute(
+            "SELECT * FROM delivery_scans WHERE scan_id=?", (original_scan_id,)
+        ).fetchone()
+        with transaction(self.connection, immediate=True):
+            cursor = self.connection.execute(
+                "INSERT INTO delivery_scans(window_id,transfer_id,scanned_at,quantity_mwh,applied_mwh,"
+                "classification,duplicates_scan_id,note,idempotency_key,actor_id,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    original["window_id"],
+                    transfer_id,
+                    utc_text(scanned_at),
+                    decimal_text(quantize_volume(quantity)),
+                    "0.000",
+                    "duplicate",
+                    original_scan_id,
+                    note,
+                    idempotency_key,
+                    actor_id,
+                    self._now(),
+                ),
+            )
+            scan_id = int(cursor.lastrowid)
+            response = {
+                "scan_id": scan_id,
+                "transfer_id": transfer_id,
+                "batch_no": int(self.connection.execute(
+                    "SELECT batch_no FROM delivery_windows WHERE window_id=?", (original["window_id"],)
+                ).fetchone()["batch_no"]),
+                "scanned_at": utc_text(scanned_at),
+                "quantity_mwh": decimal_text(quantize_volume(quantity)),
+                "applied_mwh": "0.000",
+                "classification": "duplicate",
+                "duplicates_scan_id": original_scan_id,
+                "window_state": self.connection.execute(
+                    "SELECT state FROM delivery_windows WHERE window_id=?", (original["window_id"],)
+                ).fetchone()["state"],
+            }
+            self.connection.execute(
+                "INSERT INTO supply_idempotency(scope,idempotency_key,request_sha256,response_json,created_at) "
+                "VALUES('delivery_scan',?,?,?,?)",
+                (idempotency_key, digest({"duplicate_of": original_scan_id}), canonical_json(response), self._now()),
+            )
+            self._audit(
+                "delivery_scan",
+                str(scan_id),
+                "delivery.scan_duplicate",
+                actor_id,
+                {"transfer_id": transfer_id, "duplicates_scan_id": original_scan_id},
+            )
+        return response
+
+    def delivery_status(self, actor_id: str, transfer_id: str) -> dict[str, Any]:
+        self._require(actor_id, "delivery.read")
+        transfer = self._transfer_destination(transfer_id)
+        windows = self.connection.execute(
+            "SELECT * FROM delivery_windows WHERE transfer_id=? ORDER BY batch_no", (transfer_id,)
+        ).fetchall()
+        if not windows:
+            raise NotFound("到厂窗口不存在")
+        scans = self.connection.execute(
+            "SELECT * FROM delivery_scans WHERE transfer_id=? ORDER BY scan_id", (transfer_id,)
+        ).fetchall()
+        window_rows = [self._window_dict(row["window_id"]) for row in windows]
+        # 只有首个批次承载原始待收；后续批次为结转，汇总时按各批次实收统计，避免重复计算待收。
+        received_total = quantize_volume(sum((Decimal(row["received_mwh"]) for row in windows), Decimal("0")))
+        nomination = self.connection.execute(
+            "SELECT state,delivered_mwh FROM nominations WHERE nomination_id=?",
+            (transfer["nomination_id"],),
+        ).fetchone()
+        lot_rows = self.connection.execute(
+            "SELECT lot_id,quantity_mwh,available_mwh FROM inventory_lots "
+            "WHERE lot_id LIKE ? ORDER BY lot_id",
+            (f"{transfer_id}:b%",),
+        ).fetchall()
+        return {
+            "transfer_id": transfer_id,
+            "nomination_id": transfer["nomination_id"],
+            "state": nomination["state"],
+            "delivered_mwh": nomination["delivered_mwh"],
+            "expected_original_mwh": windows[0]["expected_mwh"],
+            "received_total_mwh": decimal_text(received_total),
+            "windows": window_rows,
+            "scans": [dict(row) for row in scans],
+            "destination_inventory": [dict(row) for row in lot_rows],
         }
 
     def create_scenario(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:

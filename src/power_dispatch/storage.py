@@ -149,6 +149,50 @@ CREATE TABLE IF NOT EXISTS transfers (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS delivery_windows (
+    window_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+    batch_no INTEGER NOT NULL,
+    facility_id TEXT NOT NULL REFERENCES facilities(facility_id),
+    timezone TEXT NOT NULL,
+    tz_version TEXT NOT NULL,
+    eta_local TEXT NOT NULL,
+    eta_kind TEXT NOT NULL CHECK(eta_kind IN ('normal','gap','repeated')),
+    eta_at TEXT NOT NULL,
+    deadline_at TEXT NOT NULL,
+    grace_hours INTEGER NOT NULL,
+    expected_mwh TEXT NOT NULL,
+    received_mwh TEXT NOT NULL DEFAULT '0',
+    state TEXT NOT NULL CHECK(state IN ('open','partial','closed_on_time','closed_late','closed_carried')),
+    closes_at TEXT,
+    carried_from_window_id INTEGER REFERENCES delivery_windows(window_id),
+    created_by TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE(transfer_id, batch_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_windows_transfer
+ON delivery_windows(transfer_id, batch_no);
+
+CREATE TABLE IF NOT EXISTS delivery_scans (
+    scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_id INTEGER NOT NULL REFERENCES delivery_windows(window_id),
+    transfer_id TEXT NOT NULL REFERENCES transfers(transfer_id),
+    scanned_at TEXT NOT NULL,
+    quantity_mwh TEXT NOT NULL,
+    applied_mwh TEXT NOT NULL DEFAULT '0',
+    classification TEXT NOT NULL
+        CHECK(classification IN ('on_time','late','duplicate','invalid')),
+    duplicates_scan_id INTEGER REFERENCES delivery_scans(scan_id),
+    note TEXT NOT NULL DEFAULT '',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    actor_id TEXT NOT NULL REFERENCES supply_users(user_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_delivery_scans_window
+ON delivery_scans(window_id, scanned_at);
+
 CREATE TABLE IF NOT EXISTS supply_scenarios (
     scenario_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -198,7 +242,7 @@ ON supply_audit_events(entity_type, entity_id, event_id);
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10)
+    connection = sqlite3.connect(str(path), isolation_level=None, timeout=10, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA journal_mode=WAL")

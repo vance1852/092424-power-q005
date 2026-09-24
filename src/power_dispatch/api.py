@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import threading
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -24,6 +25,12 @@ class Response:
 class JsonApplication:
     def __init__(self, service: SupplyService) -> None:
         self.service = service
+        # 单一 SQLite 连接被多线程共享，串行化请求避免事务交错。
+        self._lock = threading.Lock()
+
+    def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+        with self._lock:
+            return self._handle(method, target, headers, body)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -44,7 +51,7 @@ class JsonApplication:
             raise ValidationFailed("请求体必须是 JSON 对象")
         return value
 
-    def handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
+    def _handle(self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b"") -> Response:
         normalized = {key.lower(): value for key, value in (headers or {}).items()}
         parsed = urlparse(target)
         path = parsed.path.rstrip("/") or "/"
@@ -77,6 +84,12 @@ class JsonApplication:
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
+            if method == "POST" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "delivery-window":
+                return Response(201, self.service.open_delivery_window(actor, parts[1], payload))
+            if method == "POST" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "delivery-scans":
+                return Response(201, self.service.record_delivery_scan(actor, parts[1], payload))
+            if method == "GET" and len(parts) == 3 and parts[0] == "transfers" and parts[2] == "delivery":
+                return Response(200, self.service.delivery_status(actor, parts[1]))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":
